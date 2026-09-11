@@ -79,9 +79,10 @@ STAKED_IDENTITY_KEY="${STAKED_IDENTITY_KEY:-}"
 SECONDARY_IDENTITY_KEY="${SECONDARY_IDENTITY_KEY:-}"
 VOTE_ACCOUNT_KEY="${VOTE_ACCOUNT_KEY:-}"
 
-# SSH private key for inter-server access
-# Paste ed25519 private key content to enable SSH between servers
+# Optional SSH private key. The script derives and authorizes its public key,
+# then shreds the private key by default.
 SSH_PRIVATE_KEY="${SSH_PRIVATE_KEY:-}"
+SSH_PRIVATE_KEY_SHRED_AFTER_INSTALL="${SSH_PRIVATE_KEY_SHRED_AFTER_INSTALL:-true}"
 
 # --- Telegram alerts (optional) ---
 # Set via env: export TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=...
@@ -262,7 +263,19 @@ if [ -n "$SSH_PRIVATE_KEY" ]; then
         echo "$PUB_KEY" >> "$HOME_DIR/.ssh/authorized_keys"
     fi
     chown "$NEW_USER:$NEW_USER" "$HOME_DIR/.ssh/id_ed25519" "$HOME_DIR/.ssh/id_ed25519.pub"
-    log_info "SSH keypair installed for inter-server access"
+    log_info "SSH public key derived and authorized"
+
+    if [ "$SSH_PRIVATE_KEY_SHRED_AFTER_INSTALL" = "true" ]; then
+        log_info "Shredding SSH private key after deriving public key"
+        if command -v shred >/dev/null 2>&1; then
+            shred -u "$HOME_DIR/.ssh/id_ed25519"
+        else
+            rm -f "$HOME_DIR/.ssh/id_ed25519"
+            log_warn "shred command not found; removed SSH private key without secure overwrite"
+        fi
+    else
+        log_warn "SSH private key left on disk because SSH_PRIVATE_KEY_SHRED_AFTER_INSTALL=false"
+    fi
 fi
 
 if ! grep -q "^$NEW_USER ALL=(ALL) NOPASSWD:ALL" /etc/sudoers; then

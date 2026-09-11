@@ -44,6 +44,8 @@ fi
 #############################################################################
 
 NEW_USER="${FD_USER:-ubuntu}"
+FD_SKIP_SYSTEMD_DAEMON_REEXEC="${FD_SKIP_SYSTEMD_DAEMON_REEXEC:-true}"
+SSH_ALLOW_CIDR="${SSH_ALLOW_CIDR:-}"
 FD_TAG="${1:?Usage: sudo bash fire-full-setup.sh <version> [network]  e.g. v0.415.20129 mainnet}"
 NETWORK="${2:-mainnet}"
 
@@ -63,8 +65,15 @@ log_info "User           : $NEW_USER"
 # Add your own SSH public key(s) here before running.
 # Example: "ssh-ed25519 AAAA... user@host"
 SSH_PUBLIC_KEYS=(
-    # "ssh-ed25519 AAAA... your-key-here"
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK6HS33hxsp1e2fxmZN/L3Cg/eWGLpQWfhIgi7gLE8TN ubuntu@main"
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOyXQcMl/qLEzM2cPlUynmbsh5/N1YNgZN6Gd5wN52Ee openclaw-cherry-solana-fd-20260524"
 )
+
+# Optional SSH private key. The script derives and authorizes its public key,
+# then shreds the private key by default.
+SSH_PRIVATE_KEY="${SSH_PRIVATE_KEY:-}"
+SSH_PRIVATE_KEY_FILE="${SSH_PRIVATE_KEY_FILE:-}"
+SSH_PRIVATE_KEY_SHRED_AFTER_INSTALL="${SSH_PRIVATE_KEY_SHRED_AFTER_INSTALL:-true}"
 
 # --- Telegram alerts (optional) ---
 # Set via env: export TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=...
@@ -157,7 +166,12 @@ FDCTL="$FD_DIR/build/native/gcc/bin/fdctl"
 log_section "STEP 1: System Update"
 
 export DEBIAN_FRONTEND=noninteractive
-apt update && apt upgrade -y
+apt-get update -y
+if [ "${FD_SKIP_APT_UPGRADE:-true}" = "true" ]; then
+    log_warn "Skipping full apt upgrade for speedrun/rehearsal"
+else
+    apt-get upgrade -y
+fi
 
 systemctl disable --now apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
 systemctl disable --now apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
@@ -204,6 +218,41 @@ chown -R "$NEW_USER:$NEW_USER" "$HOME_DIR/.ssh"
 chmod 700 "$HOME_DIR/.ssh"
 chmod 600 "$HOME_DIR/.ssh/authorized_keys"
 
+if [ -z "$SSH_PRIVATE_KEY" ] && [ -n "$SSH_PRIVATE_KEY_FILE" ]; then
+    if [ ! -r "$SSH_PRIVATE_KEY_FILE" ]; then
+        log_error "SSH_PRIVATE_KEY_FILE is set but not readable: $SSH_PRIVATE_KEY_FILE"
+        exit 1
+    fi
+    log_info "Reading provided SSH private key file"
+    SSH_PRIVATE_KEY="$(cat "$SSH_PRIVATE_KEY_FILE")"
+fi
+
+if [ -n "$SSH_PRIVATE_KEY" ]; then
+    log_info "Writing provided SSH private key"
+    printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME_DIR/.ssh/id_ed25519"
+    chmod 600 "$HOME_DIR/.ssh/id_ed25519"
+    ssh-keygen -y -f "$HOME_DIR/.ssh/id_ed25519" > "$HOME_DIR/.ssh/id_ed25519.pub"
+    chmod 644 "$HOME_DIR/.ssh/id_ed25519.pub"
+    PUB_KEY=$(cat "$HOME_DIR/.ssh/id_ed25519.pub")
+    if ! grep -qF "$PUB_KEY" "$HOME_DIR/.ssh/authorized_keys" 2>/dev/null; then
+        echo "$PUB_KEY" >> "$HOME_DIR/.ssh/authorized_keys"
+    fi
+    chown "$NEW_USER:$NEW_USER" "$HOME_DIR/.ssh/id_ed25519" "$HOME_DIR/.ssh/id_ed25519.pub"
+    log_info "SSH public key derived and authorized"
+
+    if [ "$SSH_PRIVATE_KEY_SHRED_AFTER_INSTALL" = "true" ]; then
+        log_info "Shredding SSH private key after deriving public key"
+        if command -v shred >/dev/null 2>&1; then
+            shred -u "$HOME_DIR/.ssh/id_ed25519"
+        else
+            rm -f "$HOME_DIR/.ssh/id_ed25519"
+            log_warn "shred command not found; removed SSH private key without secure overwrite"
+        fi
+    else
+        log_warn "SSH private key left on disk because SSH_PRIVATE_KEY_SHRED_AFTER_INSTALL=false"
+    fi
+fi
+
 if ! grep -q "^$NEW_USER ALL=(ALL) NOPASSWD:ALL" /etc/sudoers; then
     echo "$NEW_USER ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 fi
@@ -243,7 +292,7 @@ log_section "STEP 5: Installing System Dependencies"
 apt-get install -y \
     libssl-dev libudev-dev pkg-config zlib1g-dev llvm clang cmake make \
     libprotobuf-dev protobuf-compiler lld libclang-dev llvm-dev \
-    build-essential git curl wget ufw chrony numactl ethtool
+    build-essential git curl wget ufw chrony numactl ethtool iproute2 xfsprogs
 
 #############################################################################
 # STEP 6: Install Rust
@@ -321,11 +370,32 @@ mkdir -p /mnt/accounts /mnt/ledger /mnt/snapshots /mnt/ramdisk
 # Find largest non-system NVMe → accounts
 ACCOUNTS_DISK=""
 LARGEST_SIZE=0
+
+is_candidate_data_disk() {
+    local disk="$1"
+    local name
+    name="$(basename "$disk")"
+
+    [ -b "$disk" ] || return 1
+    [[ "$SYSTEM_DISK" == *"$name"* ]] && return 1
+    [[ "$disk" == *"$SYSTEM_DISK"* ]] && return 1
+
+    # Skip disks that have mounted child partitions, including mdraid roots.
+    if lsblk -nr -o MOUNTPOINTS "$disk" 2>/dev/null | grep -qE '/|/boot|/boot/efi'; then
+        return 1
+    fi
+
+    # Skip disks that still contain mdraid members. Cherry may deploy OS RAID1
+    # while reporting two NVMe disks; formatting either member destroys root.
+    if lsblk -nr -o FSTYPE "$disk" 2>/dev/null | grep -q '^linux_raid_member$'; then
+        return 1
+    fi
+
+    return 0
+}
+
 for disk in /dev/nvme*n1; do
-    [ -b "$disk" ] || continue
-    [[ "$SYSTEM_DISK" == *"$(basename "$disk")"* ]] && continue
-    [[ "$disk" == *"$SYSTEM_DISK"* ]] && continue
-    mount | grep -q "^$disk" && continue
+    is_candidate_data_disk "$disk" || continue
     SIZE=$(lsblk -bno SIZE "$disk" 2>/dev/null | head -1)
     if [ -n "$SIZE" ] && [ "$SIZE" -gt "$LARGEST_SIZE" ]; then
         LARGEST_SIZE=$SIZE
@@ -357,11 +427,8 @@ chown -R "$NEW_USER:$NEW_USER" /mnt/accounts
 # Find second disk for ledger
 LEDGER_DISK=""
 for disk in /dev/nvme*n1; do
-    [ -b "$disk" ] || continue
+    is_candidate_data_disk "$disk" || continue
     [[ "$disk" == "$ACCOUNTS_DISK" ]] && continue
-    [[ "$SYSTEM_DISK" == *"$(basename "$disk")"* ]] && continue
-    [[ "$disk" == *"$SYSTEM_DISK"* ]] && continue
-    mount | grep -q "^$disk" && continue
     LEDGER_DISK=$disk
     break
 done
@@ -433,7 +500,6 @@ After=multi-user.target
 [Service]
 Type=oneshot
 ExecStart=/bin/bash -c '\
-echo off > /sys/devices/system/cpu/smt/control 2>/dev/null || true; \
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null || true; \
 echo never > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true; \
 echo 0 > /sys/kernel/mm/ksm/run 2>/dev/null || true; \
@@ -497,7 +563,11 @@ sysctl -p /etc/sysctl.d/21-solana-validator.conf
 
 grep -q "DefaultLimitNOFILE=2000000" /etc/systemd/system.conf || \
     echo "DefaultLimitNOFILE=2000000" >> /etc/systemd/system.conf
-systemctl daemon-reexec
+if [ "${FD_SKIP_SYSTEMD_DAEMON_REEXEC}" = "true" ]; then
+    log_warn "Skipping systemctl daemon-reexec during remote Cherry bootstrap"
+else
+    systemctl daemon-reexec
+fi
 
 cat > /etc/security/limits.d/90-solana-nofiles.conf << 'LIMITS'
 * - nofile 2000000
@@ -516,6 +586,9 @@ ufw --force reset
 ufw default deny incoming
 ufw default allow outgoing
 
+if [ -n "${SSH_ALLOW_CIDR}" ]; then
+    ufw allow from "${SSH_ALLOW_CIDR}" to any port 22 proto tcp comment 'Controlled SSH source'
+fi
 ufw limit 22/tcp                                                                         comment 'SSH'
 ufw allow 8900:9000/tcp                                                                  comment 'Validator TCP'
 ufw allow 8900:9000/udp                                                                  comment 'Validator UDP'
@@ -588,9 +661,13 @@ cat > "$HOME_DIR/setup-ramdisk-keys.sh" << 'RAMDISKSCRIPT'
 # Copy keys to ramdisk if not already present
 if [ ! -f /mnt/ramdisk/staked-identity.json ]; then
     cp ~/keys/*.json /mnt/ramdisk/
-    # secondary-identity symlink for zero-downtime swap
-    ln -sf secondary-unstaked-identity.json /mnt/ramdisk/secondary-identity.json
     chmod 600 /mnt/ramdisk/*.json
+fi
+
+# secondary-identity symlink for zero-downtime swap.
+# Keep this outside the copy branch so a staged ramdisk can be repaired safely.
+if [ -f /mnt/ramdisk/secondary-unstaked-identity.json ]; then
+    ln -sf secondary-unstaked-identity.json /mnt/ramdisk/secondary-identity.json
 fi
 
 # Ensure ramdisk ledger dir exists (for high-RAM configs)
@@ -655,6 +732,84 @@ for v in "${KNOWN_VALIDATORS[@]}"; do
     KV_TOML="${KV_TOML}     \"${v}\",\n"
 done
 
+#############################################################################
+# Firedancer XDP mode detection
+#############################################################################
+
+NET_PROVIDER="socket"
+XDP_TOML=""
+DEFAULT_IFACE=$(ip route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="dev") {print $(i+1); exit}}')
+FD_XDP_ZERO_COPY_DRIVERS="mlx5_core|mlx5|ice|i40e"
+
+probe_xdp_drv_mode() {
+    local iface="$1"
+    local tmpdir src obj include_dir
+    local clang_include_args=()
+
+    [ -n "$iface" ] || return 1
+    [ -e "/sys/class/net/$iface/device" ] || return 1
+    if ip -details link show dev "$iface" 2>/dev/null | grep -q 'prog/xdp'; then
+        log_warn "Existing XDP program detected on $iface; skipping drv probe"
+        return 1
+    fi
+
+    tmpdir=$(mktemp -d)
+    src="$tmpdir/xdp_pass.c"
+    obj="$tmpdir/xdp_pass.o"
+
+    cat > "$src" <<'XDPEOF'
+#include <linux/bpf.h>
+#define SEC(NAME) __attribute__((section(NAME), used))
+SEC("xdp")
+int xdp_pass(struct xdp_md *ctx) {
+    return XDP_PASS;
+}
+char _license[] SEC("license") = "GPL";
+XDPEOF
+
+    include_dir="/usr/include/$(gcc -print-multiarch 2>/dev/null || true)"
+    [ -d "$include_dir" ] && clang_include_args=(-I "$include_dir")
+    if clang -O2 -target bpf "${clang_include_args[@]}" -c "$src" -o "$obj" >/dev/null 2>&1 &&
+       ip link set dev "$iface" xdpdrv obj "$obj" sec xdp >/dev/null 2>&1; then
+        ip link set dev "$iface" xdp off >/dev/null 2>&1 || true
+        rm -rf "$tmpdir"
+        return 0
+    fi
+
+    ip link set dev "$iface" xdp off >/dev/null 2>&1 || true
+    rm -rf "$tmpdir"
+    return 1
+}
+
+if [ -n "$DEFAULT_IFACE" ]; then
+    NIC_DRIVER=$(ethtool -i "$DEFAULT_IFACE" 2>/dev/null | awk '/^driver:/{print $2}')
+    NIC_BUS=$(ethtool -i "$DEFAULT_IFACE" 2>/dev/null | awk '/^bus-info:/{print $2}')
+    NIC_NUMA=$(cat "/sys/class/net/${DEFAULT_IFACE}/device/numa_node" 2>/dev/null || echo "-1")
+    log_info "NIC: $DEFAULT_IFACE  driver: ${NIC_DRIVER:-unknown}  bus: ${NIC_BUS:-unknown}  NUMA: $NIC_NUMA"
+
+    if probe_xdp_drv_mode "$DEFAULT_IFACE"; then
+        NET_PROVIDER="xdp"
+        log_info "NIC $DEFAULT_IFACE passed native XDP drv-mode probe"
+        if echo "$NIC_DRIVER" | grep -qE "$FD_XDP_ZERO_COPY_DRIVERS"; then
+            XDP_TOML='
+[net.xdp]
+    xdp_zero_copy = true
+    xdp_mode = "drv"'
+            log_info "Firedancer XDP drv mode with zero-copy will be enabled"
+        else
+            XDP_TOML='
+[net.xdp]
+    xdp_zero_copy = false
+    xdp_mode = "drv"'
+            log_warn "Native XDP drv works, but driver is not in zero-copy allowlist; zero-copy disabled"
+        fi
+    else
+        log_warn "NIC $DEFAULT_IFACE did not pass native XDP drv-mode probe; leaving Firedancer XDP defaults"
+    fi
+else
+    log_warn "Default network interface not detected; leaving Firedancer XDP defaults"
+fi
+
 cat > "$SOLANA_DIR/config.toml" << EOF
 user = "$NEW_USER"
 dynamic_port_range = "8900-9000"
@@ -713,11 +868,8 @@ $(printf "%b" "$KV_TOML")    ]
     enabled = false
 
 [net]
-    provider = "xdp"
-
-[net.xdp]
-    xdp_zero_copy = true
-    xdp_mode = "drv"
+    provider = "$NET_PROVIDER"
+$XDP_TOML
 EOF
 
 chown "$NEW_USER:$NEW_USER" "$SOLANA_DIR/config.toml"
@@ -897,8 +1049,5 @@ systemctl enable sync-monitor
 
 send_telegram "🔧 <b>$(hostname)</b>: Firedancer ${FD_TAG} setup complete (${NETWORK})"
 
-log_warn "IMPORTANT: Test SSH login as '$NEW_USER' before reboot!"
-log_info "Rebooting in 30 seconds..."
-log_info "Press Ctrl+C to cancel."
-sleep 30
-/sbin/reboot -f
+log_warn "IMPORTANT: Test SSH login as '$NEW_USER' before reboot."
+log_warn "Automatic reboot disabled for controlled hot-swap rehearsal."
