@@ -50,7 +50,7 @@ FD_TAG="${1:?Usage: sudo bash fire-full-setup.sh <version> [network]  e.g. v0.41
 NETWORK="${2:-mainnet}"
 
 # Official Firedancer repo
-FD_REPO="https://github.com/firedancer-io/firedancer.git"
+FD_REPO="https://github.com/jito-foundation/firebam.git"
 
 if [[ "$NETWORK" != "testnet" && "$NETWORK" != "mainnet" ]]; then
     log_error "NETWORK must be 'testnet' or 'mainnet', got: $NETWORK"
@@ -64,10 +64,7 @@ log_info "User           : $NEW_USER"
 # --- SSH public keys ---
 # Add your own SSH public key(s) here before running.
 # Example: "ssh-ed25519 AAAA... user@host"
-SSH_PUBLIC_KEYS=(
-    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK6HS33hxsp1e2fxmZN/L3Cg/eWGLpQWfhIgi7gLE8TN ubuntu@main"
-    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOyXQcMl/qLEzM2cPlUynmbsh5/N1YNgZN6Gd5wN52Ee openclaw-cherry-solana-fd-20260524"
-)
+SSH_PUBLIC_KEYS=()
 
 # Optional SSH private key. The script derives and authorizes its public key,
 # then shreds the private key by default.
